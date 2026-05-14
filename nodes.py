@@ -12,6 +12,7 @@ import torch
 
 import folder_paths
 from nodes import MAX_RESOLUTION
+import comfy
 
 from .saver.saver import save_image
 from .utils import sanitize_filename, get_sha256, full_checkpoint_path_for
@@ -60,6 +61,23 @@ def apply_custom_time_format(filename: str) -> str:
 
     return re.sub(pattern, replace_format, filename)
 
+def apply_custom_counter_format(filename: str, counter: int) -> str:
+    """
+    Replace %counter<padding> patterns with formatted counter.
+    Example: %counter<03> with counter=1 becomes 001
+    """
+    pattern = r'%counter<([0-9]+)>'
+    def replace_format(match):
+        padding_str = match.group(1)
+        try:
+            # Create format string like "{:03d}"
+            fmt = "{:0" + padding_str + "d}"
+            return fmt.format(counter)
+        except:
+            return match.group(0)
+
+    return re.sub(pattern, replace_format, filename)
+
 def save_json(image_info: dict[str, Any] | None, filename: str) -> None:
     try:
         workflow = (image_info or {}).get('workflow')
@@ -72,8 +90,9 @@ def save_json(image_info: dict[str, Any] | None, filename: str) -> None:
         print(f'Failed to save workflow as json due to: {e}, proceeding with the remainder of saving execution')
 
 def make_pathname(filename: str, width: int, height: int, seed: int, modelname: str, counter: int, time_format: str, sampler_name: str, steps: int, cfg: float, scheduler_name: str, denoise: float, clip_skip: int, custom: str) -> str:
-    # Process custom time_format patterns first
+    # Process custom format patterns first
     filename = apply_custom_time_format(filename)
+    filename = apply_custom_counter_format(filename, counter)
     filename = filename.replace("%date", get_timestamp("%Y-%m-%d"))
     filename = filename.replace("%time", get_timestamp(time_format))
     filename = filename.replace("%model", parse_checkpoint_name(modelname))
@@ -117,6 +136,9 @@ class Metadata:
     ckpt_path: str
     a111_params: str
     final_hashes: str
+    raw_positive: str = ""
+    raw_negative: str = ""
+    raw_additional_hashes: str = ""
 
 class ImageSaverMetadata:
     @classmethod
@@ -173,6 +195,10 @@ class ImageSaverMetadata:
 
     @staticmethod
     def make_metadata(modelname: str, positive: str, negative: str, width: int, height: int, seed_value: int, steps: int, cfg: float, sampler_name: str, scheduler_name: str, denoise: float, clip_skip: int, custom: str, additional_hashes: str, download_civitai_data: bool, easy_remix: bool) -> Metadata:
+        raw_positive = positive
+        raw_negative = negative
+        raw_additional_hashes = additional_hashes
+
         modelname, additional_hashes = ImageSaver.get_multiple_models(modelname, additional_hashes)
 
         ckpt_path = full_checkpoint_path_for(modelname)
@@ -246,7 +272,7 @@ class ImageSaverMetadata:
 
         final_hashes = ",".join(hash_parts)
 
-        metadata = Metadata(modelname, positive, negative, width, height, seed_value, steps, cfg, sampler_name, scheduler_name, denoise, clip_skip, custom, additional_hashes, ckpt_path, a111_params, final_hashes)
+        metadata = Metadata(modelname, positive, negative, width, height, seed_value, steps, cfg, sampler_name, scheduler_name, denoise, clip_skip, custom, additional_hashes, ckpt_path, a111_params, final_hashes, raw_positive, raw_negative, raw_additional_hashes)
         return metadata
 
 class ImageSaverSimple:
@@ -583,3 +609,298 @@ class ImageSaver:
         if base_suffix is None:
             return filename_prefix
         return f"{filename_prefix}_{base_suffix + batch_index:02d}"
+
+class MakeImageSaverPipe:
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, Any]:
+        return {
+            "required": {
+                "filename":              ("STRING",  {"default": '%time_%basemodelname_%seed', "multiline": False, "tooltip": "filename (available variables: %date, %time, %time_format<format>, %model, %width, %height, %seed, %counter, %sampler_name, %steps, %cfg, %scheduler_name, %basemodelname, %denoise, %clip_skip)"}),
+                "path":                  ("STRING",  {"default": '', "multiline": False,                           "tooltip": "path to save the images (under Comfy's save directory)"}),
+                "extension":             (['png', 'jpeg', 'jpg', 'webp'], {                                        "tooltip": "file extension/type to save image as"}),
+                "seed_value":            ("INT",     {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "seed"}),
+                "steps":                 ("INT",     {"default": 20, "min": 1, "max": 10000,                       "tooltip": "number of steps"}),
+                "cfg":                   ("FLOAT",   {"default": 7.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01, "tooltip": "CFG value"}),
+                "sampler":               (comfy.samplers.KSampler.SAMPLERS, {                                      "tooltip": "sampler name"}),
+                "scheduler":             (comfy.samplers.KSampler.SCHEDULERS, {                                    "tooltip": "scheduler name"}),
+                "denoise":               ("FLOAT",   {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,        "tooltip": "denoise value"}),
+                "width":                 ("INT",     {"default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 8,  "tooltip": "image width"}),
+                "height":                ("INT",     {"default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 8,  "tooltip": "image height"}),
+                "positive":              ("STRING",  {"default": 'unknown', "multiline": True,                     "tooltip": "positive prompt"}),
+                "negative":              ("STRING",  {"default": 'unknown', "multiline": True,                     "tooltip": "negative prompt"}),
+            },
+            "optional": {
+                "modelname":             ("STRING",  {"default": '', "multiline": False,                           "tooltip": "model name (can be multiple, separated by commas)"}),
+                "lossless_webp":         ("BOOLEAN", {"default": True,                                             "tooltip": "if True, saved WEBP files will be lossless"}),
+                "quality_jpeg_or_webp":  ("INT",     {"default": 100, "min": 1, "max": 100,                        "tooltip": "quality setting of JPEG/WEBP"}),
+                "optimize_png":          ("BOOLEAN", {"default": False,                                            "tooltip": "if True, saved PNG files will be optimized (can reduce file size but is slower)"}),
+                "counter":               ("INT",     {"default": 0, "min": 0, "max": 0xffffffffffffffff,           "tooltip": "counter"}),
+                "clip_skip":             ("INT",     {"default": 0, "min": -24, "max": 24,                         "tooltip": "skip last CLIP layers (positive or negative value, 0 for no skip)"}),
+                "time_format":           ("STRING",  {"default": "%Y-%m-%d-%H%M%S", "multiline": False,            "tooltip": "timestamp format"}),
+                "save_workflow_as_json": ("BOOLEAN", {"default": False,                                            "tooltip": "if True, also saves the workflow as a separate JSON file"}),
+                "embed_workflow":        ("BOOLEAN", {"default": True,                                             "tooltip": "if True, embeds the workflow in the saved image files.\nStable for PNG, experimental for WEBP.\nJPEG experimental and only if metadata size is below 65535 bytes"}),
+                "additional_hashes":     ("STRING",  {"default": "", "multiline": False,                           "tooltip": "hashes separated by commas, optionally with names. 'Name:HASH' (e.g., 'MyLoRA:FF735FF83F98')\nWith download_civitai_data set to true, weights can be added as well. (e.g., 'HASH:Weight', 'Name:HASH:Weight')"}),
+                "download_civitai_data": ("BOOLEAN", {"default": True,                                             "tooltip": "Download and cache data from civitai.com to save correct metadata. Allows LoRA weights to be saved to the metadata."}),
+                "easy_remix":            ("BOOLEAN", {"default": True,                                             "tooltip": "Strip LoRAs and simplify 'embedding:path' from the prompt to make the Remix option on civitai.com more seamless."}),
+                "custom":                ("STRING",  {"default": "", "multiline": False,                           "tooltip": "custom string to add to the metadata, inserted into the a111 string between clip skip and model hash"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGESAVER_PIPE",)
+    RETURN_NAMES = ("pipe",)
+    FUNCTION = "make_pipe"
+    CATEGORY = "ImageSaver/Pipe"
+    DESCRIPTION = "Bundles metadata and Image Saver settings into a single Pipe connection."
+
+    def make_pipe(self, **kwargs) -> tuple[dict[str, Any]]:
+        metadata = ImageSaverMetadata.make_metadata(
+            modelname=kwargs.get("modelname") if kwargs.get("modelname") is not None else "",
+            positive=kwargs.get("positive") if kwargs.get("positive") is not None else "unknown",
+            negative=kwargs.get("negative") if kwargs.get("negative") is not None else "unknown",
+            width=kwargs.get("width") if kwargs.get("width") is not None else 512,
+            height=kwargs.get("height") if kwargs.get("height") is not None else 512,
+            seed_value=kwargs.get("seed_value") if kwargs.get("seed_value") is not None else 0,
+            steps=kwargs.get("steps") if kwargs.get("steps") is not None else 20,
+            cfg=kwargs.get("cfg") if kwargs.get("cfg") is not None else 7.0,
+            sampler_name=kwargs.get("sampler") if kwargs.get("sampler") is not None else "",
+            scheduler_name=kwargs.get("scheduler") if kwargs.get("scheduler") is not None else "normal",
+            denoise=kwargs.get("denoise") if kwargs.get("denoise") is not None else 1.0,
+            clip_skip=kwargs.get("clip_skip") if kwargs.get("clip_skip") is not None else 0,
+            custom=kwargs.get("custom") if kwargs.get("custom") is not None else "",
+            additional_hashes=kwargs.get("additional_hashes") if kwargs.get("additional_hashes") is not None else "",
+            download_civitai_data=kwargs.get("download_civitai_data") if kwargs.get("download_civitai_data") is not None else True,
+            easy_remix=kwargs.get("easy_remix") if kwargs.get("easy_remix") is not None else True
+        )
+        saver_config = {
+            "filename": kwargs.get("filename") if kwargs.get("filename") is not None else '%time_%basemodelname_%seed',
+            "path": kwargs.get("path") if kwargs.get("path") is not None else '',
+            "extension": kwargs.get("extension") if kwargs.get("extension") is not None else 'png',
+            "lossless_webp": kwargs.get("lossless_webp") if kwargs.get("lossless_webp") is not None else True,
+            "quality_jpeg_or_webp": kwargs.get("quality_jpeg_or_webp") if kwargs.get("quality_jpeg_or_webp") is not None else 100,
+            "optimize_png": kwargs.get("optimize_png") if kwargs.get("optimize_png") is not None else False,
+            "embed_workflow": kwargs.get("embed_workflow") if kwargs.get("embed_workflow") is not None else True,
+            "save_workflow_as_json": kwargs.get("save_workflow_as_json") if kwargs.get("save_workflow_as_json") is not None else False,
+            "counter": kwargs.get("counter") if kwargs.get("counter") is not None else 0,
+            "time_format": kwargs.get("time_format") if kwargs.get("time_format") is not None else "%Y-%m-%d-%H%M%S",
+            "download_civitai_data": kwargs.get("download_civitai_data") if kwargs.get("download_civitai_data") is not None else True,
+            "easy_remix": kwargs.get("easy_remix") if kwargs.get("easy_remix") is not None else True
+        }
+        return ({"metadata": metadata, "saver_config": saver_config},)
+
+class EditImageSaverPipe:
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, Any]:
+        return {
+            "required": {
+                "pipe":                  ("IMAGESAVER_PIPE",),
+            },
+            "optional": {
+                "filename":              ("STRING",  {"forceInput": True, "tooltip": "String inputs support the [original] placeholder to append/prepend."}),
+                "path":                  ("STRING",  {"forceInput": True, "tooltip": "String inputs support the [original] placeholder to append/prepend."}),
+                "extension":             (['png', 'jpeg', 'jpg', 'webp'], {"forceInput": True}),
+                "seed_value":            ("INT",     {"forceInput": True}),
+                "steps":                 ("INT",     {"forceInput": True}),
+                "cfg":                   ("FLOAT",   {"forceInput": True}),
+                "sampler":               (comfy.samplers.KSampler.SAMPLERS, {"forceInput": True}),
+                "scheduler":             (comfy.samplers.KSampler.SCHEDULERS, {"forceInput": True}),
+                "denoise":               ("FLOAT",   {"forceInput": True}),
+                "width":                 ("INT",     {"forceInput": True}),
+                "height":                ("INT",     {"forceInput": True}),
+                "positive":              ("STRING",  {"forceInput": True, "tooltip": "String inputs support the [original] placeholder to append/prepend."}),
+                "negative":              ("STRING",  {"forceInput": True, "tooltip": "String inputs support the [original] placeholder to append/prepend."}),
+                "modelname":             ("STRING",  {"forceInput": True, "tooltip": "String inputs support the [original] placeholder to append/prepend."}),
+                "lossless_webp":         ("BOOLEAN", {"forceInput": True, "tooltip": "if True, saved WEBP files will be lossless"}),
+                "quality_jpeg_or_webp":  ("INT",     {"forceInput": True}),
+                "optimize_png":          ("BOOLEAN", {"forceInput": True, "tooltip": "if True, saved PNG files will be optimized (can reduce file size but is slower)"}),
+                "counter":               ("INT",     {"forceInput": True}),
+                "clip_skip":             ("INT",     {"forceInput": True}),
+                "time_format":           ("STRING",  {"forceInput": True, "tooltip": "String inputs support the [original] placeholder to append/prepend."}),
+                "save_workflow_as_json": ("BOOLEAN", {"forceInput": True, "tooltip": "if True, also saves the workflow as a separate JSON file"}),
+                "embed_workflow":        ("BOOLEAN", {"forceInput": True, "tooltip": "if True, embeds the workflow in the saved image files."}),
+                "additional_hashes":     ("STRING",  {"forceInput": True, "tooltip": "String inputs support the [original] placeholder to append/prepend."}),
+                "download_civitai_data": ("BOOLEAN", {"forceInput": True, "tooltip": "Download and cache data from civitai.com to save correct metadata."}),
+                "easy_remix":            ("BOOLEAN", {"forceInput": True, "tooltip": "Strip LoRAs and simplify 'embedding:path' from the prompt."}),
+                "custom":                ("STRING",  {"forceInput": True, "tooltip": "String inputs support the [original] placeholder to append/prepend."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGESAVER_PIPE",)
+    RETURN_NAMES = ("pipe",)
+    FUNCTION = "edit_pipe"
+    CATEGORY = "ImageSaver/Pipe"
+    DESCRIPTION = "Safely override metadata or saver settings in an existing Image Saver Pipe.\nString fields support the '[original]' placeholder to append/prepend."
+
+    def edit_pipe(self, pipe: dict[str, Any], **kwargs) -> tuple[dict[str, Any]]:
+        metadata = pipe["metadata"]
+        saver_config = pipe["saver_config"]
+
+        def apply_string_edit(new_val: Any, original_val: Any) -> Any:
+            if new_val is not None:
+                if isinstance(new_val, str) and "[original]" in new_val:
+                    return new_val.replace("[original]", str(original_val) if original_val is not None else "")
+                return new_val
+            return original_val
+
+        # 1. Determine if any metadata fields were actually modified
+        metadata_fields = [
+            "modelname", "positive", "negative", "width", "height", "seed_value", "steps", 
+            "cfg", "sampler", "scheduler", "denoise", "clip_skip", "custom", "additional_hashes",
+            "download_civitai_data", "easy_remix"
+        ]
+        
+        metadata_modified = any(kwargs.get(field) is not None for field in metadata_fields)
+
+        # 2. Re-generate metadata ONLY if needed
+        if metadata_modified:
+            modelname = apply_string_edit(kwargs.get("modelname"), metadata.modelname)
+            positive = apply_string_edit(kwargs.get("positive"), getattr(metadata, 'raw_positive', metadata.positive))
+            negative = apply_string_edit(kwargs.get("negative"), getattr(metadata, 'raw_negative', metadata.negative))
+            width = kwargs.get("width") if kwargs.get("width") is not None else metadata.width
+            height = kwargs.get("height") if kwargs.get("height") is not None else metadata.height
+            seed_value = kwargs.get("seed_value") if kwargs.get("seed_value") is not None else metadata.seed
+            steps = kwargs.get("steps") if kwargs.get("steps") is not None else metadata.steps
+            cfg = kwargs.get("cfg") if kwargs.get("cfg") is not None else metadata.cfg
+            sampler_name = apply_string_edit(kwargs.get("sampler"), metadata.sampler_name)
+            scheduler_name = apply_string_edit(kwargs.get("scheduler"), metadata.scheduler_name)
+            denoise = kwargs.get("denoise") if kwargs.get("denoise") is not None else metadata.denoise
+            clip_skip = kwargs.get("clip_skip") if kwargs.get("clip_skip") is not None else metadata.clip_skip
+            custom = apply_string_edit(kwargs.get("custom"), metadata.custom)
+            
+            original_additional_hashes = getattr(metadata, 'raw_additional_hashes', metadata.additional_hashes)
+            additional_hashes = apply_string_edit(kwargs.get("additional_hashes"), original_additional_hashes)
+            
+            download_civitai_data = kwargs.get("download_civitai_data") if kwargs.get("download_civitai_data") is not None else saver_config.get("download_civitai_data", True)
+            easy_remix = kwargs.get("easy_remix") if kwargs.get("easy_remix") is not None else saver_config.get("easy_remix", True)
+
+            new_metadata = ImageSaverMetadata.make_metadata(
+                modelname, positive, negative, width, height, seed_value, steps, cfg, sampler_name, scheduler_name,
+                denoise, clip_skip, custom, additional_hashes, download_civitai_data, easy_remix
+            )
+        else:
+            new_metadata = metadata
+        
+        # Override Saver fields if provided
+        new_saver_config = {
+            "filename": apply_string_edit(kwargs.get("filename"), saver_config.get("filename")),
+            "path": apply_string_edit(kwargs.get("path"), saver_config.get("path")),
+            "extension": apply_string_edit(kwargs.get("extension"), saver_config.get("extension")),
+            "lossless_webp": kwargs.get("lossless_webp") if kwargs.get("lossless_webp") is not None else saver_config.get("lossless_webp", True),
+            "quality_jpeg_or_webp": kwargs.get("quality_jpeg_or_webp") if kwargs.get("quality_jpeg_or_webp") is not None else saver_config.get("quality_jpeg_or_webp"),
+            "optimize_png": kwargs.get("optimize_png") if kwargs.get("optimize_png") is not None else saver_config.get("optimize_png", False),
+            "embed_workflow": kwargs.get("embed_workflow") if kwargs.get("embed_workflow") is not None else saver_config.get("embed_workflow", True),
+            "save_workflow_as_json": kwargs.get("save_workflow_as_json") if kwargs.get("save_workflow_as_json") is not None else saver_config.get("save_workflow_as_json", False),
+            "counter": kwargs.get("counter") if kwargs.get("counter") is not None else saver_config.get("counter"),
+            "time_format": apply_string_edit(kwargs.get("time_format"), saver_config.get("time_format")),
+            "download_civitai_data": kwargs.get("download_civitai_data") if kwargs.get("download_civitai_data") is not None else saver_config.get("download_civitai_data", True),
+            "easy_remix": kwargs.get("easy_remix") if kwargs.get("easy_remix") is not None else saver_config.get("easy_remix", True)
+        }
+        
+        return ({"metadata": new_metadata, "saver_config": new_saver_config},)
+
+class ReadImageSaverPipe:
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, Any]:
+        return {
+            "required": {
+                "pipe": ("IMAGESAVER_PIPE",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGESAVER_PIPE", "STRING", "STRING", "STRING", "INT", "INT", "FLOAT", comfy.samplers.KSampler.SAMPLERS, comfy.samplers.KSampler.SCHEDULERS, "FLOAT", "INT", "INT", "STRING", "STRING", "STRING", "INT", "INT", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("pipe", "filename", "path", "extension", "seed_value", "steps", "cfg", "sampler", "scheduler", "denoise", "width", "height", "positive", "negative", "modelname", "counter", "clip_skip", "time_format", "additional_hashes", "custom")
+    FUNCTION = "read_pipe"
+    CATEGORY = "ImageSaver/Pipe"
+    DESCRIPTION = "Extracts metadata and saver settings from an existing Image Saver Pipe."
+
+    def read_pipe(self, pipe: dict[str, Any]) -> tuple[Any, ...]:
+        metadata = pipe["metadata"]
+        saver_config = pipe["saver_config"]
+        
+        return (
+            pipe,
+            saver_config.get("filename", ""),
+            saver_config.get("path", ""),
+            saver_config.get("extension", ""),
+            metadata.seed,
+            metadata.steps,
+            metadata.cfg,
+            metadata.sampler_name,
+            metadata.scheduler_name,
+            metadata.denoise,
+            metadata.width,
+            metadata.height,
+            getattr(metadata, 'raw_positive', metadata.positive),
+            getattr(metadata, 'raw_negative', metadata.negative),
+            metadata.modelname,
+            saver_config.get("counter", 0),
+            metadata.clip_skip,
+            saver_config.get("time_format", ""),
+            metadata.additional_hashes,
+            metadata.custom
+        )
+
+class ImageSaverFromPipe:
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, Any]:
+        return {
+            "required": {
+                "images":                ("IMAGE",   {"tooltip": "image(s) to save"}),
+                "pipe":                  ("IMAGESAVER_PIPE",),
+            },
+            "optional": {
+                "show_preview":          ("BOOLEAN", {"default": True, "tooltip": "if True, displays saved images in the UI preview"}),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
+        }
+
+    RETURN_TYPES = ("IMAGESAVER_PIPE", "STRING", "STRING")
+    RETURN_NAMES = ("pipe", "hashes", "a1111_params")
+    OUTPUT_TOOLTIPS = ("The input pipe for chaining", "Comma-separated list of the hashes to chain with other Image Saver additional_hashes","Written parameters to the image metadata")
+    FUNCTION = "save_files"
+
+    OUTPUT_NODE = True
+
+    CATEGORY = "ImageSaver/Pipe"
+    DESCRIPTION = "Save images using settings and metadata unpacked from an Image Saver Pipe."
+
+    def save_files(self,
+        images: list[torch.Tensor],
+        pipe: dict[str, Any],
+        show_preview: bool = True,
+        prompt: dict[str, Any] | None = None,
+        extra_pnginfo: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        metadata = pipe.get("metadata")
+        config = pipe.get("saver_config", {})
+        
+        if metadata is None:
+            metadata = Metadata('', '', '', 512, 512, 0, 20, 7.0, '', 'normal', 1.0, 0, '', '', '', '', '')
+
+        filename = config.get("filename", '%time_%basemodelname_%seed')
+        path = config.get("path", '')
+        extension = config.get("extension", 'png')
+        quality_jpeg_or_webp = config.get("quality_jpeg_or_webp", 100)
+        lossless_webp = config.get("lossless_webp", True)
+        optimize_png = config.get("optimize_png", False)
+        save_workflow_as_json = config.get("save_workflow_as_json", False)
+        embed_workflow = config.get("embed_workflow", True)
+        counter = config.get("counter", 0)
+        time_format = config.get("time_format", "%Y-%m-%d-%H%M%S")
+
+        final_path = make_pathname(path, metadata.width, metadata.height, metadata.seed, metadata.modelname, counter, time_format, metadata.sampler_name, metadata.steps, metadata.cfg, metadata.scheduler_name, metadata.denoise, metadata.clip_skip, metadata.custom)
+
+        filenames = ImageSaver.save_images(images, filename, extension, final_path, quality_jpeg_or_webp, lossless_webp, optimize_png, prompt, extra_pnginfo, save_workflow_as_json, embed_workflow, counter, time_format, metadata)
+
+        subfolder = os.path.normpath(final_path)
+
+        result: dict[str, Any] = {
+            "result": (pipe, metadata.final_hashes, metadata.a111_params),
+        }
+
+        if show_preview:
+            result["ui"] = {"images": [{"filename": fname, "subfolder": subfolder if subfolder != '.' else '', "type": 'output'} for fname in filenames]}
+
+        return result
